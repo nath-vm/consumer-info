@@ -1,15 +1,17 @@
-const { sendServerError } = require('../utils/errors');
 require('dotenv').config();
 const jwt              = require('jsonwebtoken');
-const { randomUUID: uuidv4 } = require('crypto');
+const crypto           = require('crypto');
 const { OAuth2Client } = require('google-auth-library');
-const { sendMail }     = require('../utils/mailer');
+const { BrevoClient }  = require('@getbrevo/brevo');
 const bcrypt           = require('bcryptjs');
 
 const AuditLog    = require('../models/AuditLog');
 const AdminConfig = require('../models/AdminConfig');
 const RefreshToken = require('../models/RefreshToken');
 const { calcNextRotation } = require('../utils/rotationUtils');
+const escapeRegex = require('../utils/escapeRegex');
+const { serverError } = require('../utils/httpErrors');
+const { JWT_OPTIONS } = require('../middleware/auth');
 
 const JWT_SECRET     = require('../config/jwtSecret');
 const ACCESS_TTL     = '15m';
@@ -25,9 +27,26 @@ const COOKIE_OPTS = {
   path:     '/',
 };
 
+function getBrevo() {
+  return new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
+}
+
+// The access-token COOKIE lives as long as the refresh token; the JWT inside it still expires after
+// ACCESS_TTL (15m). When it does, the server answers TOKEN_EXPIRED and the frontend silently refreshes.
+// (If the cookie itself expired at 15m, the server would only ever see "no token" and never refresh.)
+function setAccessCookie(res, accessToken) {
+  res.cookie('accessToken', accessToken, { ...COOKIE_OPTS, maxAge: REFRESH_TTL_MS });
+}
+
 function setAuthCookies(res, accessToken, refreshToken) {
-  res.cookie('accessToken',  accessToken,  { ...COOKIE_OPTS, maxAge: 15 * 60 * 1000 });
-  res.cookie('refreshToken', refreshToken, { ...COOKIE_OPTS, maxAge: 7 * 24 * 60 * 60 * 1000 });
+  setAccessCookie(res, accessToken);
+  res.cookie('refreshToken', refreshToken, { ...COOKIE_OPTS, maxAge: REFRESH_TTL_MS });
+}
+
+// Cookie / body values can be objects (cookie-parser decodes "j:{...}" cookies into JSON objects, and
+// req.body is attacker-controlled). Only plain strings may ever reach a database filter.
+function asString(value) {
+  return typeof value === 'string' ? value : null;
 }
 
 function clearAuthCookies(res) {
@@ -39,7 +58,13 @@ async function sendNotification(subject, text) {
   try {
     const config = await AdminConfig.findOne();
     if (!config || !config.notificationEmails?.length) return;
-    await sendMail({ to: config.notificationEmails, subject, text });
+    const brevo = getBrevo();
+    await brevo.transactionalEmails.sendTransacEmail({
+      sender:      { email: process.env.SMTP_USER, name: 'Consumer Info System' },
+      to:          config.notificationEmails.map(e => ({ email: e })),
+      subject,
+      textContent: text,
+    });
     console.log(`[MAIL] Sent "${subject}"`);
   } catch (e) {
     console.error('[MAIL] Failed to send notification:', e.message);
@@ -48,13 +73,13 @@ async function sendNotification(subject, text) {
 
 // ── JWT helpers ───────────────────────────────────────────────────────────────
 function signAccess(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: ACCESS_TTL });
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: ACCESS_TTL, algorithm: 'HS256' });
 }
 
 async function issueTokens(role, sub, email = null) {
   const jwtPayload   = { role, sub, ...(email ? { email } : {}) };
   const accessToken  = signAccess(jwtPayload);
-  const refreshToken = uuidv4();
+  const refreshToken = crypto.randomBytes(32).toString('hex'); // 256-bit random, no extra dependency
   await RefreshToken.create({
     token:      refreshToken,
     role,
@@ -71,10 +96,6 @@ async function audit(action, { actor = 'system', target = null, detail = {}, ip 
   } catch (e) {
     console.error('[AUDIT] Failed to write log:', e.message);
   }
-}
-
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 // ── Get real client IP ────────────────────────────────────────────────────────
@@ -111,34 +132,32 @@ exports.checkAuth = (req, res) => {
   }
   if (!token) return res.json({ authenticated: false });
   try {
-    const p = jwt.verify(token, JWT_SECRET);
+    const p = jwt.verify(token, JWT_SECRET, JWT_OPTIONS);
     return res.json({ authenticated: true, role: p.role });
   } catch {
     return res.json({ authenticated: false });
   }
 };
 
-exports.adminLogin = async (req, res) => {
-  const { credential } = req.body;
-  const ip = getClientIp(req);
-
-  if (!credential || typeof credential !== 'string') return res.status(400).json({ message: 'Google credential required.' });
-
+/**
+ * Shared admin sign-in logic used by BOTH the popup flow (JSON) and the redirect flow (form post).
+ * Verifies the Google ID token, requires a verified + whitelisted email, then issues session tokens.
+ * Returns { ok: true, tokens } or { ok: false, status, reason, message }.
+ */
+async function performAdminLogin(credential, ip) {
   let email;
   try {
     const ticket = await googleClient.verifyIdToken({
       idToken:  credential,
       audience: process.env.GOOGLE_CLIENT_ID,
     });
-    const googlePayload = ticket.getPayload();
-    if (!googlePayload.email || googlePayload.email_verified !== true) {
-      await audit('ADMIN_LOGIN_FAILED', { actor: 'unknown', ip, success: false, detail: { reason: 'email_not_verified' } });
-      return res.status(401).json({ message: 'Google account email is not verified.' });
-    }
-    email = googlePayload.email.toLowerCase().trim();
+    const payload = ticket.getPayload();
+    // Only trust the email if Google says the account owner has verified it.
+    if (!payload.email || payload.email_verified !== true) throw new Error('email_not_verified');
+    email = payload.email.toLowerCase().trim();
   } catch (e) {
     await audit('ADMIN_LOGIN_FAILED', { actor: 'unknown', ip, success: false, detail: { reason: 'invalid_google_token' } });
-    return res.status(401).json({ message: 'Invalid Google token.' });
+    return { ok: false, status: 401, reason: 'invalid', message: 'Invalid Google token.' };
   }
 
   const config = await getOrCreateConfig();
@@ -148,26 +167,59 @@ exports.adminLogin = async (req, res) => {
     if (email.toLowerCase() === bootstrap) {
       config.adminGmails.push(bootstrap);
       await config.save();
-      console.log(`[BOOTSTRAP] First admin auto-approved: ${bootstrap}`);
+      console.log('[BOOTSTRAP] First admin auto-approved.');
     }
   }
 
   if (!config.adminGmails.includes(email)) {
     await audit('ADMIN_LOGIN_FAILED', { actor: email, ip, success: false, detail: { reason: 'gmail_not_approved' } });
-    return res.status(403).json({ message: 'Your Google account is not approved for admin access.' });
+    return { ok: false, status: 403, reason: 'not_approved', message: 'Your Google account is not approved for admin access.' };
   }
 
   const tokens = await issueTokens('admin', email, email);
   await audit('ADMIN_LOGIN_SUCCESS', { actor: email, ip, detail: { email } });
-  setAuthCookies(res, tokens.accessToken, tokens.refreshToken);
+  return { ok: true, tokens };
+}
+
+// Popup flow: the browser sends the Google credential as JSON and reads a JSON answer.
+exports.adminLogin = async (req, res) => {
+  const credential = asString(req.body?.credential);
+  if (!credential) return res.status(400).json({ message: 'Google credential required.' });
+
+  const result = await performAdminLogin(credential, getClientIp(req));
+  if (!result.ok) return res.status(result.status).json({ message: result.message });
+
+  setAuthCookies(res, result.tokens.accessToken, result.tokens.refreshToken);
   return res.json({ message: 'Login successful.', role: 'admin' });
 };
 
+// Redirect flow (no popup, so popup blockers cannot interfere): Google's page POSTs a
+// form (credential + g_csrf_token) to this URL, and we answer with a redirect back to the app.
+exports.adminLoginRedirect = async (req, res) => {
+  const adminPath = '/' + String(process.env.ADMIN_ROUTE || 'p3-admin').replace(/^\/+/, '');
+  const fail = (reason) => res.redirect(303, `${adminPath}?login_error=${reason}`);
+
+  // Double-submit CSRF check required by Google: the g_csrf_token cookie must equal the form field.
+  const cookieToken = asString(req.cookies?.g_csrf_token);
+  const bodyToken = asString(req.body?.g_csrf_token);
+  if (!cookieToken || !bodyToken || cookieToken !== bodyToken) return fail('csrf');
+
+  const credential = asString(req.body?.credential);
+  if (!credential) return fail('invalid');
+
+  const result = await performAdminLogin(credential, getClientIp(req));
+  if (!result.ok) return fail(result.reason);
+
+  setAuthCookies(res, result.tokens.accessToken, result.tokens.refreshToken);
+  return res.redirect(303, '/'); // the app sees role=admin and forwards to the admin screen
+};
+
 exports.userLogin = async (req, res) => {
-  const { password } = req.body;
+  const password = asString(req.body?.password);
   const ip = getClientIp(req);
 
-  if (!password || typeof password !== 'string') return res.status(400).json({ message: 'Password required.' });
+  if (!password) return res.status(400).json({ message: 'Password required.' });
+  if (password.length > 200) return res.status(400).json({ message: 'Incorrect password.' });
 
   try {
     const config = await getOrCreateConfig();
@@ -193,14 +245,12 @@ exports.userLogin = async (req, res) => {
     setAuthCookies(res, tokens.accessToken, tokens.refreshToken);
     return res.json({ message: 'Login successful.', role: 'user' });
   } catch (err) {
-    console.error('[USER_LOGIN ERROR]', err);
-    return sendServerError(res, err, 'authController', 'Login failed.');
+    return serverError(req, res, err, 'Login failed. Please try again.');
   }
 };
 
 exports.refreshToken = async (req, res) => {
-  try {
-  const refreshToken = req.cookies?.refreshToken || req.body?.refreshToken;
+  const refreshToken = asString(req.cookies?.refreshToken) || asString(req.body?.refreshToken);
   if (!refreshToken) return res.status(400).json({ message: 'Refresh token required.' });
 
   const record = await RefreshToken.findOne({ token: refreshToken, revoked: false });
@@ -224,31 +274,17 @@ exports.refreshToken = async (req, res) => {
   }
 
   const accessToken = signAccess({ role: record.role, sub: record.consumerId, ...(record.role === 'admin' ? { email: record.consumerId } : {}) });
-  res.cookie('accessToken', accessToken, { ...COOKIE_OPTS, maxAge: 15 * 60 * 1000 });
-  return res.json({ accessToken });
-  } catch (err) {
-    return sendServerError(res, err, 'refreshToken', 'Could not refresh session.');
-  }
+  setAccessCookie(res, accessToken);
+  // The token travels only in the httpOnly cookie; it is never exposed to page JavaScript.
+  return res.json({ message: 'Session refreshed.' });
 };
 
 exports.logout = async (req, res) => {
-  const refreshToken = req.cookies?.refreshToken || req.body?.refreshToken;
+  const refreshToken = asString(req.cookies?.refreshToken) || asString(req.body?.refreshToken);
   if (refreshToken) await RefreshToken.updateOne({ token: refreshToken }, { revoked: true });
   clearAuthCookies(res);
-  await audit('LOGOUT', { actor: req.adminEmail || 'user', ip: req.ip });
+  await audit('LOGOUT', { actor: req.adminEmail || (req.role === 'user' ? 'user' : 'anonymous'), ip: getClientIp(req) });
   return res.json({ message: 'Logged out.' });
-};
-
-exports.sessionInfo = async (req, res) => {
-  try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer '))
-      return res.status(401).json({ message: 'Not authenticated.' });
-    const payload = jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-    return res.json({ role: payload.role, email: payload.email || null, sub: payload.sub });
-  } catch {
-    return res.status(401).json({ message: 'Invalid token.' });
-  }
 };
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -268,19 +304,22 @@ exports.getAppConfig = async (req, res) => {
       notificationEmails: config.notificationEmails,
     });
   } catch (err) {
-    return sendServerError(res, err, 'authController', 'Failed to load config.');
+    serverError(req, res, err, 'Failed to load config.');
   }
 };
 
 exports.updateUserPassword = async (req, res) => {
   try {
-    const { userPassword } = req.body;
+    const userPassword = asString(req.body?.userPassword);
     const ip = getClientIp(req);
     if (!userPassword || userPassword.trim() === '')
       return res.status(400).json({ message: 'Password cannot be empty.' });
+    const newPassword = userPassword.trim();
+    // bcrypt only uses the first 72 bytes, so longer passwords would silently be truncated.
+    if (newPassword.length < 8 || Buffer.byteLength(newPassword, 'utf8') > 72)
+      return res.status(400).json({ message: 'Password must be 8 to 72 characters.' });
 
     const config = await getOrCreateConfig();
-    const newPassword = userPassword.trim();
     config.userPassword       = await bcrypt.hash(newPassword, 10);
     config.lastPasswordChange = new Date();
     config.nextPasswordChange = calcNextRotation(config.passwordRotation);
@@ -295,13 +334,13 @@ exports.updateUserPassword = async (req, res) => {
 
     res.json({ message: 'User password updated. All user sessions have been logged out.', lastPasswordChange: config.lastPasswordChange, nextPasswordChange: config.nextPasswordChange });
   } catch (err) {
-    return sendServerError(res, err, 'authController', 'Failed to update password.');
+    serverError(req, res, err, 'Failed to update password.');
   }
 };
 
 exports.updatePasswordRotation = async (req, res) => {
   try {
-    const { passwordRotation } = req.body;
+    const { passwordRotation } = req.body || {};
     const ip = getClientIp(req);
     if (!['daily', 'weekly', 'monthly', 'manual'].includes(passwordRotation))
       return res.status(400).json({ message: 'Invalid rotation value.' });
@@ -318,13 +357,13 @@ exports.updatePasswordRotation = async (req, res) => {
     await audit('PASSWORD_ROTATION_UPDATED', { actor: req.adminEmail, ip, detail: { passwordRotation } });
     res.json({ message: 'Password rotation updated.', nextPasswordChange: config.nextPasswordChange });
   } catch (err) {
-    return sendServerError(res, err, 'authController', 'Failed to update rotation.');
+    serverError(req, res, err, 'Failed to update rotation.');
   }
 };
 
 exports.toggleUserAccess = async (req, res) => {
   try {
-    const { userAccessEnabled } = req.body;
+    const { userAccessEnabled } = req.body || {};
     const ip = getClientIp(req);
     if (typeof userAccessEnabled !== 'boolean')
       return res.status(400).json({ message: 'userAccessEnabled must be boolean.' });
@@ -342,16 +381,16 @@ exports.toggleUserAccess = async (req, res) => {
     );
     res.json({ message: `User access ${userAccessEnabled ? 'enabled' : 'disabled'}.`, userAccessEnabled });
   } catch (err) {
-    return sendServerError(res, err, 'authController', 'Failed to toggle user access.');
+    serverError(req, res, err, 'Failed to toggle user access.');
   }
 };
 
 exports.addAdminGmail = async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = asString(req.body?.email);
     const ip = getClientIp(req);
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!email || !emailRegex.test(email.trim())) return res.status(400).json({ message: 'Valid email address required.' });
+    if (!email || email.length > 254 || !emailRegex.test(email.trim())) return res.status(400).json({ message: 'Valid email address required.' });
     const normalized = email.trim().toLowerCase();
 
     const config = await getOrCreateConfig();
@@ -367,7 +406,7 @@ exports.addAdminGmail = async (req, res) => {
     );
     res.json({ message: `${normalized} added to admin list.`, adminGmails: config.adminGmails });
   } catch (err) {
-    return sendServerError(res, err, 'authController', 'Failed to add Gmail.');
+    serverError(req, res, err, 'Failed to add Gmail.');
   }
 };
 
@@ -393,16 +432,16 @@ exports.removeAdminGmail = async (req, res) => {
     );
     res.json({ message: `${normalized} removed from admin list.`, adminGmails: config.adminGmails });
   } catch (err) {
-    return sendServerError(res, err, 'authController', 'Failed to remove Gmail.');
+    serverError(req, res, err, 'Failed to remove Gmail.');
   }
 };
 
 exports.updateNotificationEmails = async (req, res) => {
   try {
-    const { notificationEmails } = req.body;
+    const { notificationEmails } = req.body || {};
     const ip = getClientIp(req);
-    if (!Array.isArray(notificationEmails))
-      return res.status(400).json({ message: 'notificationEmails must be an array.' });
+    if (!Array.isArray(notificationEmails) || !notificationEmails.every((e) => typeof e === 'string'))
+      return res.status(400).json({ message: 'notificationEmails must be an array of strings.' });
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     const cleaned = notificationEmails.map(e => e.trim().toLowerCase()).filter(Boolean);
@@ -419,21 +458,21 @@ exports.updateNotificationEmails = async (req, res) => {
     await audit('NOTIFICATION_EMAILS_UPDATED', { actor: req.adminEmail, ip, detail: { count: config.notificationEmails.length } });
     res.json({ message: 'Notification emails updated.', notificationEmails: config.notificationEmails });
   } catch (err) {
-    return sendServerError(res, err, 'authController', 'Failed to update notification emails.');
+    serverError(req, res, err, 'Failed to update notification emails.');
   }
 };
 
 exports.getAuditLog = async (req, res) => {
   try {
-    const limit   = Math.min(parseInt(req.query.limit   || '50'), 200);
-    const page    = Math.max(parseInt(req.query.page    || '1'),  1);
-    const action  = req.query.action  || '';
-    const actor   = req.query.actor   || '';
+    const limit   = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+    const page    = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const action  = asString(req.query.action) || '';
+    const actor   = asString(req.query.actor)  || '';
     const success = req.query.success;
 
     const filter = {};
-    if (action)              filter.action  = new RegExp(escapeRegex(String(action)), 'i');
-    if (actor)               filter.actor   = new RegExp(escapeRegex(String(actor)), 'i');
+    if (action)              filter.action  = new RegExp(escapeRegex(action.slice(0, 100)), 'i');
+    if (actor)               filter.actor   = new RegExp(escapeRegex(actor.slice(0, 100)),  'i');
     if (success === 'true')  filter.success = true;
     if (success === 'false') filter.success = false;
 
@@ -443,7 +482,7 @@ exports.getAuditLog = async (req, res) => {
     ]);
     res.json({ logs, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
-    return sendServerError(res, err, 'authController', 'Failed to fetch audit logs.');
+    serverError(req, res, err, 'Failed to fetch audit logs.');
   }
 };
 
@@ -454,10 +493,12 @@ exports.sendTestNotification = async (req, res) => {
       return res.status(400).json({ message: 'No notification emails configured. Add at least one email in the Notifications tab first.' });
     }
 
-    await sendMail({
-      to:      config.notificationEmails,
-      subject: 'Consumer Info System — Test Notification',
-      text: [
+    const brevo = getBrevo();
+    await brevo.transactionalEmails.sendTransacEmail({
+      sender:      { email: process.env.SMTP_USER, name: 'Consumer Info System' },
+      to:          config.notificationEmails.map(e => ({ email: e })),
+      subject:     'Consumer Info System — Test Notification',
+      textContent: [
         'This is a test notification from your Consumer Information System.',
         '',
         `Sent at:    ${new Date().toLocaleString()}`,
@@ -477,12 +518,6 @@ exports.sendTestNotification = async (req, res) => {
 
     res.json({ message: `Test email sent to: ${config.notificationEmails.join(', ')}` });
   } catch (err) {
-    console.error('[MAIL] Test notification failed:', err.message);
-    const hint = err.status === 403
-      ? 'Resend rejected the email. With the default test sender it can only deliver to the email address that owns your Resend account; verify a domain and set MAIL_FROM to send to others.'
-      : err.message === 'RESEND_API_KEY is not set'
-        ? 'Email is not configured on the server (RESEND_API_KEY is missing).'
-        : 'Failed to send test email.';
-    return sendServerError(res, err, 'authController', hint);
+    serverError(req, res, err, 'Failed to send test email. Check the server logs and your Brevo settings.');
   }
 };

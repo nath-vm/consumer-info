@@ -1,51 +1,9 @@
-const { sendServerError } = require('../utils/errors');
 const AuditLog  = require('../models/AuditLog');
 const Consumer  = require('../models/Consumer');
 const mongoose  = require('mongoose');
 
-// ── Allowed consumer fields (must match Consumer schema exactly) ───────────────
-const ALLOWED_FIELDS = new Set([
-  'sn',
-  'pelcoMeterNumber',
-  'accountNumber',
-  'poleNumber',
-  'pelcoSq',
-  'roverBook',
-  'accountName',
-  'status',
-  'address',
-  'isHidden',
-]);
-
-const MAX_FIELD_LENGTH = 200;
-
-/**
- * Normalize an account number the same way everywhere:
- * trim whitespace, collapse any internal whitespace, uppercase.
- * This means "05011090", " 05011090 ", "050 110 90" all become "05011090".
- * Applied on EVERY write (insert/upsert) and EVERY read (checkDuplicates filter).
- */
-function normalizeAccountNumber(raw) {
-  return String(raw).trim().replace(/\s+/g, '').toUpperCase();
-}
-
-function sanitize(obj) {
-  const clean = {};
-  for (const key of ALLOWED_FIELDS) {
-    if (Object.prototype.hasOwnProperty.call(obj, key)) {
-      const val = obj[key];
-      if (typeof val === 'string') {
-        let s = val.trim().slice(0, MAX_FIELD_LENGTH);
-        // Normalize accountNumber specifically so it's stored consistently
-        if (key === 'accountNumber') s = normalizeAccountNumber(s);
-        clean[key] = s;
-      } else {
-        clean[key] = val;
-      }
-    }
-  }
-  return clean;
-}
+const { sanitizeConsumer: sanitize, normalizeAccountNumber } = require('../utils/sanitizeConsumer');
+const { serverError, writeError } = require('../utils/httpErrors');
 
 const logBatchAction = async (action, req, detail = {}) => {
   try {
@@ -73,12 +31,16 @@ exports.batchAddConsumers = async (req, res) => {
     if (consumers.length > MAX_BATCH_SIZE) {
       return res.status(400).json({ message: `Batch too large. Maximum ${MAX_BATCH_SIZE} records per import.` });
     }
-    const clean = consumers.map(sanitize);
+    // Drop rows that end up empty after sanitising (e.g. null, wrong types, unknown fields only).
+    const clean = consumers.map(sanitize).filter((c) => Object.keys(c).length > 0);
+    if (clean.length === 0) {
+      return res.status(400).json({ message: 'No valid consumers provided.' });
+    }
     const inserted = await Consumer.insertMany(clean);
     await logBatchAction('CONSUMER_BULK_IMPORT', req, { count: inserted.length });
     res.status(201).json(inserted);
   } catch (err) {
-    console.error('[batchController]', err); return res.status(400).json({ message: 'Invalid data.' });
+    writeError(req, res, err);
   }
 };
 
@@ -105,7 +67,7 @@ exports.checkDuplicates = async (req, res) => {
 
     res.json({ matches });
   } catch (err) {
-    return sendServerError(res, err, 'batchController');
+    serverError(req, res, err);
   }
 };
 
@@ -150,7 +112,7 @@ exports.batchUpsertConsumers = async (req, res) => {
     // Return total so frontend can calculate "overwritten" accurately
     res.status(200).json({ inserted, modified, total: valid.length });
   } catch (err) {
-    return sendServerError(res, err, 'batchController');
+    serverError(req, res, err);
   }
 };
 
@@ -164,7 +126,10 @@ exports.batchUpdateConsumers = async (req, res) => {
       return res.status(400).json({ message: `Batch too large. Maximum ${MAX_BATCH_SIZE} records per update.` });
     }
 
-    const validUpdates = updates.filter(({ _id }) => mongoose.isValidObjectId(_id));
+    // Each row must be an object whose _id is a canonical 24-hex ObjectId string.
+    const validUpdates = updates.filter(
+      (u) => u && typeof u === 'object' && typeof u._id === 'string' && /^[a-f\d]{24}$/i.test(u._id) && mongoose.isValidObjectId(u._id)
+    );
     if (validUpdates.length === 0) {
       return res.status(400).json({ message: 'No records with a valid ID provided.' });
     }
@@ -180,7 +145,7 @@ exports.batchUpdateConsumers = async (req, res) => {
     await logBatchAction('CONSUMER_BULK_UPDATE', req, { modifiedCount: result.modifiedCount });
     res.json({ modifiedCount: result.modifiedCount });
   } catch (err) {
-    return sendServerError(res, err, 'batchController');
+    serverError(req, res, err);
   }
 };
 
@@ -209,6 +174,6 @@ exports.normalizeAccountNumbers = async (req, res) => {
     await logBatchAction('ACCOUNT_NUMBER_NORMALIZATION', req, { updated: result.modifiedCount });
     res.json({ message: 'Normalization complete.', updated: result.modifiedCount, total: all.length });
   } catch (err) {
-    return sendServerError(res, err, 'batchController');
+    serverError(req, res, err);
   }
 };

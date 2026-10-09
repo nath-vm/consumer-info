@@ -1,11 +1,9 @@
-const { sendServerError } = require('../utils/errors');
 const RoverBook = require('../models/RoverBook');
 const Consumer  = require('../models/Consumer');
 const AuditLog  = require('../models/AuditLog');
 
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+const escapeRegex = require('../utils/escapeRegex');
+const { serverError } = require('../utils/httpErrors');
 
 // ── Cascade: when a rover book address changes, update all matching consumers ──
 // Mirrors AT's propagateToAssemblies pattern.
@@ -47,7 +45,7 @@ exports.getAll = async (req, res) => {
     const entries = await RoverBook.find().collation({ locale: "en", numericOrdering: true }).sort({ roverNumber: 1 }).lean();
     res.json(entries);
   } catch (err) {
-    return sendServerError(res, err, 'roverBookController');
+    serverError(req, res, err);
   }
 };
 
@@ -60,7 +58,7 @@ exports.getByRoverNumber = async (req, res) => {
     if (!entry) return res.status(404).json({ message: 'Rover number not found' });
     res.json(entry);
   } catch (err) {
-    return sendServerError(res, err, 'roverBookController');
+    serverError(req, res, err);
   }
 };
 
@@ -68,7 +66,7 @@ exports.getByRoverNumber = async (req, res) => {
 // Used by the import flow to resolve addresses in bulk without N+1 requests.
 exports.bulkLookup = async (req, res) => {
   try {
-    const { roverNumbers } = req.body;
+    const { roverNumbers } = req.body || {};
     if (!Array.isArray(roverNumbers) || roverNumbers.length === 0) {
       return res.json({ entries: [] });
     }
@@ -80,7 +78,7 @@ exports.bulkLookup = async (req, res) => {
     const entries = await RoverBook.find({ roverNumber: { $in: normalised } }).lean();
     res.json({ entries });
   } catch (err) {
-    return sendServerError(res, err, 'roverBookController');
+    serverError(req, res, err);
   }
 };
 
@@ -100,8 +98,9 @@ exports.batchUpsert = async (req, res) => {
     const valid = [];
     const invalid = [];
     for (const e of entries) {
-      const roverNumber = String(e.roverNumber || '').trim();
-      const address     = String(e.address     || '').trim();
+      if (!e || typeof e !== 'object') { invalid.push(e); continue; }
+      const roverNumber = String(e.roverNumber || '').trim().slice(0, 200);
+      const address     = String(e.address     || '').trim().slice(0, 200);
       if (!roverNumber || !address) {
         invalid.push(e);
       } else {
@@ -136,16 +135,17 @@ exports.batchUpsert = async (req, res) => {
     await audit('ROVERBOOK_BULK_UPSERT', req, { inserted, modified, invalid: invalid.length, consumersUpdated });
     res.status(200).json({ inserted, modified, invalid: invalid.length, total: valid.length, consumersUpdated });
   } catch (err) {
-    return sendServerError(res, err, 'roverBookController');
+    serverError(req, res, err);
   }
 };
 
 // POST — add a new entry
 exports.create = async (req, res) => {
   try {
-    const { roverNumber, address } = req.body;
-    if (!roverNumber?.trim()) return res.status(400).json({ message: 'Rover number is required.' });
-    if (!address?.trim())     return res.status(400).json({ message: 'Address is required.' });
+    const { roverNumber, address } = req.body || {};
+    if (typeof roverNumber !== 'string' || !roverNumber.trim()) return res.status(400).json({ message: 'Rover number is required.' });
+    if (typeof address !== 'string' || !address.trim())         return res.status(400).json({ message: 'Address is required.' });
+    if (roverNumber.length > 200 || address.length > 200)       return res.status(400).json({ message: 'Value too long (max 200 characters).' });
 
     // Case-insensitive duplicate check
     const exists = await RoverBook.findOne({
@@ -160,16 +160,17 @@ exports.create = async (req, res) => {
     await audit('ROVERBOOK_ADDED', req, { roverNumber: entry.roverNumber });
     res.status(201).json(entry);
   } catch (err) {
-    return sendServerError(res, err, 'roverBookController');
+    serverError(req, res, err);
   }
 };
 
 // PUT /:id — update an entry
 exports.update = async (req, res) => {
   try {
-    const { roverNumber, address } = req.body;
-    if (!roverNumber?.trim()) return res.status(400).json({ message: 'Rover number is required.' });
-    if (!address?.trim())     return res.status(400).json({ message: 'Address is required.' });
+    const { roverNumber, address } = req.body || {};
+    if (typeof roverNumber !== 'string' || !roverNumber.trim()) return res.status(400).json({ message: 'Rover number is required.' });
+    if (typeof address !== 'string' || !address.trim())         return res.status(400).json({ message: 'Address is required.' });
+    if (roverNumber.length > 200 || address.length > 200)       return res.status(400).json({ message: 'Value too long (max 200 characters).' });
 
     const existing = await RoverBook.findById(req.params.id);
     if (!existing) return res.status(404).json({ message: 'Entry not found.' });
@@ -191,7 +192,7 @@ exports.update = async (req, res) => {
     await audit('ROVERBOOK_UPDATED', req, { roverNumber: existing.roverNumber, consumersUpdated });
     res.json({ ...existing.toObject(), consumersUpdated });
   } catch (err) {
-    return sendServerError(res, err, 'roverBookController');
+    serverError(req, res, err);
   }
 };
 
@@ -203,6 +204,6 @@ exports.remove = async (req, res) => {
     await audit('ROVERBOOK_DELETED', req, { roverNumber: entry.roverNumber });
     res.json({ message: 'Deleted.' });
   } catch (err) {
-    return sendServerError(res, err, 'roverBookController');
+    serverError(req, res, err);
   }
 };

@@ -1,6 +1,16 @@
 const rateLimit = require('express-rate-limit');
 
-// General auth rate limiter — 20 attempts per 15 min
+// General API limiter: a broad safety net for every /api route (per IP).
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
+  message: { message: 'Too many requests. Please slow down.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => req.path === '/health',
+});
+
+// General auth rate limiter: 20 attempts per 15 min
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -9,7 +19,7 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Strict limiter for sensitive actions — 5 per 15 min
+// Strict limiter for sensitive actions: 5 per 15 min
 const strictLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
@@ -18,7 +28,7 @@ const strictLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Search limiter — protect the public consumer search endpoint
+// Search limiter: protects the consumer search / lookup endpoints
 const searchLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
@@ -27,4 +37,4 @@ const searchLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-module.exports = { authLimiter, strictLimiter, searchLimiter };
+module.exports = { apiLimiter, authLimiter, strictLimiter, searchLimiter };

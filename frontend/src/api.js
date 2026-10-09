@@ -33,7 +33,12 @@ api.interceptors.response.use(
       return Promise.reject(err);
     }
 
-    if (status === 401 && code === 'TOKEN_EXPIRED' && !original._retry) {
+    // The server answers 401 with one of these codes when the 15-minute access token is missing,
+    // expired or invalid. In every case the right move is one silent refresh attempt using the
+    // long-lived refresh cookie. (The refresh call itself is excluded so it can never loop.)
+    const REFRESHABLE = ['TOKEN_EXPIRED', 'NO_TOKEN', 'INVALID_TOKEN'];
+    const isRefreshCall = original?.url?.endsWith('/api/auth/refresh');
+    if (status === 401 && REFRESHABLE.includes(code) && !original._retry && !isRefreshCall) {
       if (isRefreshing) {
         return new Promise((resolve, reject) => {
           failedQueue.push({ resolve, reject });

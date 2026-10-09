@@ -45,5 +45,9 @@
       "last 1 safari version"
     ]
   },
-  "description": "React frontend for Consumer Info."
+  "description": "React (Create React App + Material UI) frontend for the Consumer Information System.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  }
 }

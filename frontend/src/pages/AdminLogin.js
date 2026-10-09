@@ -8,8 +8,24 @@ import CircularProgress from '@mui/material/CircularProgress';
 import { GoogleOAuthProvider, GoogleLogin } from '@react-oauth/google';
 import api from '../api';
 
+// Production uses Google's REDIRECT mode: the whole page navigates to Google and back, so
+// popup blockers / privacy extensions cannot stop it. Google posts the result to our API
+// (through the Vercel /api proxy). Local development keeps the popup mode, because the
+// Create React App dev server cannot receive that form post.
+const USE_REDIRECT = process.env.NODE_ENV === 'production';
+
+const REDIRECT_ERRORS = {
+  csrf: 'Sign-in could not be verified. Please try again (and make sure cookies are enabled).',
+  invalid: 'Google sign-in failed or your email is not verified. Please try again.',
+  not_approved: 'Your Google account is not approved for admin access.',
+};
+
 const AdminLogin = () => {
-  const [error, setError]     = useState(null);
+  // After a redirect-mode sign-in the API sends us back here with ?login_error=<code>
+  const [error, setError] = useState(() => {
+    const code = new URLSearchParams(window.location.search).get('login_error');
+    return code ? (REDIRECT_ERRORS[code] || 'Sign-in failed. Please try again.') : null;
+  });
   const [loading, setLoading] = useState(false);
 
   const handleGoogleSuccess = async (credentialResponse) => {
@@ -62,6 +78,10 @@ const AdminLogin = () => {
                 onSuccess={handleGoogleSuccess}
                 onError={handleGoogleError}
                 useOneTap={false}
+                {...(USE_REDIRECT && {
+                  ux_mode: 'redirect',
+                  login_uri: `${window.location.origin}/api/auth/admin-login-redirect`,
+                })}
                 theme="outline"
                 size="large"
                 text="signin_with"

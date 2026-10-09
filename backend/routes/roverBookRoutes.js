@@ -1,20 +1,25 @@
 const express = require('express');
-const router  = express.Router();
-const rb      = require('../controllers/roverBookController');
+const router = express.Router();
+const rb = require('../controllers/roverBookController');
 const { requireAdmin } = require('../middleware/auth');
 const { searchLimiter } = require('../middleware/rateLimiter');
-const validateObjectId = require('../middleware/validateObjectId');
+const asyncHandler = require('../utils/asyncHandler');
+const validateObjectId = require('../utils/validateObjectId');
 
-// Lookups feed the auto-fill in the admin add/edit forms, so they are admin-only
-// (previously public, which exposed the rover-book address list to anyone).
-router.get('/lookup/:roverNumber', requireAdmin, searchLimiter, rb.getByRoverNumber);
-router.post('/bulk-lookup',        requireAdmin, searchLimiter, rb.bulkLookup);
+const json = express.json({ limit: '100kb' });
+const bigJson = express.json({ limit: '10mb' });
 
-// Admin-only CRUD
-router.get('/',             requireAdmin, rb.getAll);
-router.post('/batch-upsert',requireAdmin, rb.batchUpsert);
-router.post('/',            requireAdmin, rb.create);
-router.put('/:id',          requireAdmin, validateObjectId(), rb.update);
-router.delete('/:id',       requireAdmin, validateObjectId(), rb.remove);
+router.param('id', validateObjectId);
+
+// The rover book is only used by the admin screens (auto-fill in add/edit forms and
+// the import flow), so every route is admin-only. It used to be public.
+router.get('/lookup/:roverNumber', requireAdmin, searchLimiter, asyncHandler(rb.getByRoverNumber));
+router.post('/bulk-lookup', requireAdmin, searchLimiter, json, asyncHandler(rb.bulkLookup));
+
+router.get('/', requireAdmin, asyncHandler(rb.getAll));
+router.post('/batch-upsert', requireAdmin, bigJson, asyncHandler(rb.batchUpsert));
+router.post('/', requireAdmin, json, asyncHandler(rb.create));
+router.put('/:id', requireAdmin, json, asyncHandler(rb.update));
+router.delete('/:id', requireAdmin, asyncHandler(rb.remove));
 
 module.exports = router;

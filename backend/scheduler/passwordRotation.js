@@ -7,28 +7,38 @@ const bcrypt       = require('bcryptjs');
 const AdminConfig  = require('../models/AdminConfig');
 const RefreshToken = require('../models/RefreshToken');
 const AuditLog     = require('../models/AuditLog');
-const { sendMail, isMailConfigured } = require('../utils/mailer');
+const { BrevoClient } = require('@getbrevo/brevo');
 const { calcNextRotation } = require('../utils/rotationUtils');
 
 const CHECK_INTERVAL_MS = 30 * 60 * 1000;
 
-// Throws if the email cannot be sent: the caller must NOT rotate the password in that case,
-// otherwise the new password would be lost.
-async function sendRotationNotification(config, newPassword, nextDate) {
-  await sendMail({
-    to:      config.notificationEmails,
-    subject: 'Consumer System — Scheduled Password Rotation',
-    text: [
-      'The shared user password was automatically rotated by the scheduled rotation policy.',
-      '',
-      `New Password: ${newPassword}`,
-      '',
-      `Rotated at: ${new Date().toLocaleString()}`,
-      `Next rotation: ${nextDate ? nextDate.toLocaleDateString() : 'Manual only'}`,
-      '',
-      'All active user sessions have been logged out.',
-    ].join('\n'),
-  });
+function getBrevo() {
+  return new BrevoClient({ apiKey: process.env.BREVO_API_KEY });
+}
+
+async function sendRotationNotification(newPassword, nextDate) {
+  try {
+    const config = await AdminConfig.findOne();
+    if (!config || !config.notificationEmails?.length) return;
+    const brevo = getBrevo();
+    await brevo.transactionalEmails.sendTransacEmail({
+      sender:      { email: process.env.SMTP_USER, name: 'Consumer Info System' },
+      to:          config.notificationEmails.map(e => ({ email: e })),
+      subject:     'Consumer System — Scheduled Password Rotation',
+      textContent: [
+        'The shared user password was automatically rotated by the scheduled rotation policy.',
+        '',
+        `New Password: ${newPassword}`,
+        '',
+        `Rotated at: ${new Date().toLocaleString()}`,
+        `Next rotation: ${nextDate ? nextDate.toLocaleDateString() : 'Manual only'}`,
+        '',
+        'All active user sessions have been logged out.',
+      ].join('\n'),
+    });
+  } catch (e) {
+    console.error('[SCHEDULER] Failed to send rotation email:', e.message);
+  }
 }
 
 function generatePassword(length = 12) {
@@ -47,26 +57,10 @@ async function runRotationCheck() {
     const now = new Date();
     if (now < config.nextPasswordChange) return;
 
-    // Safety: rotating without a working way to tell the admins the new password
-    // would lock everyone out, so skip (and retry at the next check) unless email is ready.
-    if (!isMailConfigured() || !config.notificationEmails?.length) {
-      console.warn('[SCHEDULER] Rotation due, but email is not configured or no notification recipients are set. Skipping so the new password is not lost.');
-      return;
-    }
-
     const newPassword = generatePassword();
-    const nextDate    = calcNextRotation(config.passwordRotation);
-
-    try {
-      await sendRotationNotification(config, newPassword, nextDate);
-    } catch (mailErr) {
-      console.error('[SCHEDULER] Could not email the new password; rotation skipped:', mailErr.message);
-      return;
-    }
-
     config.userPassword       = await bcrypt.hash(newPassword, 10);
     config.lastPasswordChange = now;
-    config.nextPasswordChange = nextDate;
+    config.nextPasswordChange = calcNextRotation(config.passwordRotation);
     await config.save();
 
     await RefreshToken.updateMany({ role: 'user', revoked: false }, { revoked: true });
@@ -76,6 +70,7 @@ async function runRotationCheck() {
     });
 
     console.log(`[SCHEDULER] Password auto-rotated. Next: ${config.nextPasswordChange?.toISOString() ?? 'manual'}`);
+    await sendRotationNotification(newPassword, config.nextPasswordChange);
   } catch (err) {
     console.error('[SCHEDULER] Password rotation check failed:', err.message);
   }
@@ -87,4 +82,4 @@ function startPasswordRotationScheduler() {
   setInterval(runRotationCheck, CHECK_INTERVAL_MS);
 }
 
-module.exports = { startPasswordRotationScheduler, runRotationCheck };
+module.exports = { startPasswordRotationScheduler, runRotationCheck, generatePassword };

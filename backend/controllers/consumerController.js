@@ -1,16 +1,18 @@
-const { sendServerError } = require('../utils/errors');
-const AuditLog  = require('../models/AuditLog');
-const Consumer  = require('../models/Consumer');
+const AuditLog = require('../models/AuditLog');
+const Consumer = require('../models/Consumer');
+const { sanitizeConsumer } = require('../utils/sanitizeConsumer');
+const escapeRegex = require('../utils/escapeRegex');
+const { serverError, writeError } = require('../utils/httpErrors');
 
-// Helper — write a consumer-action audit entry
+// Helper: write a consumer-action audit entry
 const logConsumerAction = async (action, req, target = null, detail = {}, success = true) => {
   try {
     await AuditLog.create({
       action,
-      actor:   req.adminEmail || req.userId || 'unknown',
+      actor: req.adminEmail || req.userId || 'unknown',
       target,
       detail,
-      ip:      req.ip || req.headers['x-forwarded-for'] || null,
+      ip: req.ip || req.headers['x-forwarded-for'] || null,
       success,
     });
   } catch (err) {
@@ -18,141 +20,103 @@ const logConsumerAction = async (action, req, target = null, detail = {}, succes
   }
 };
 
-// Escape special regex characters from user input to prevent ReDoS
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Allowed fields for single-record add/update (mirrors batchController ALLOWED_FIELDS)
-const ALLOWED_FIELDS = [
-  'sn', 'pelcoMeterNumber', 'accountNumber', 'poleNumber',
-  'pelcoSq', 'roverBook', 'accountName', 'status', 'address', 'isHidden',
-];
-
-// Max character length for any string field — prevents oversized payloads
-// bloating the DB or causing out-of-memory errors on the server.
-const MAX_FIELD_LENGTH = 200;
-
+// Fields the UI's "search in" dropdown may restrict a search to.
 const SEARCHABLE_FIELDS = [
-  'sn', 'pelcoMeterNumber', 'accountNumber', 'poleNumber',
-  'pelcoSq', 'roverBook', 'accountName', 'status', 'address',
+  'sn', 'pelcoMeterNumber', 'accountNumber', 'poleNumber', 'pelcoSq',
+  'roverBook', 'accountName', 'status', 'address',
 ];
+const MAX_QUERY_LENGTH = 100;
 
-function sanitize(obj) {
-  const clean = {};
-  for (const key of ALLOWED_FIELDS) {
-    if (Object.prototype.hasOwnProperty.call(obj, key)) {
-      const val = obj[key];
-      // Cap string fields; pass booleans (e.g. isHidden) through unchanged
-      clean[key] = typeof val === 'string'
-        ? val.trim().slice(0, MAX_FIELD_LENGTH)
-        : val;
-    }
-  }
-  return clean;
-}
-
-const mongoose = require('mongoose');
-function isValidId(id) {
-  return mongoose.isValidObjectId(id);
-}
-
-// Search consumers with server-side pagination
+// Search consumers with server-side pagination.
+// Route is protected by requireAuth (user or admin), so req.adminEmail is set only for admins.
 exports.searchConsumers = async (req, res) => {
-  const { includeHidden, page = 1, limit = 50, allPages } = req.query;
-  const query = typeof req.query.query === 'string' ? req.query.query : '';
-  const field = typeof req.query.field === 'string' ? req.query.field : '';
+  const { includeHidden, page = 1, limit, allPages, field } = req.query;
+  // Query-string values can be arrays/objects (?query[]=a); only accept a plain string.
+  const query = typeof req.query.query === 'string' ? req.query.query.trim().slice(0, MAX_QUERY_LENGTH) : '';
 
-  // Only admins (verified by JWT) may request hidden consumers.
-  // Regular users and unauthenticated callers always see active records only.
-  const isAdmin = req.adminEmail != null;
+  // Only admins may see hidden consumers, request huge pages, or export everything.
+  const isAdmin = req.role === 'admin';
   const showHidden = isAdmin && includeHidden === 'true';
 
   try {
-    // Use $ne: true for the active filter so records where isHidden is null,
-    // undefined, or missing (e.g. imported before the field existed) are
-    // treated as active rather than silently disappearing from all queries.
+    // $ne: true so records where isHidden is null/missing still count as active.
     const filter = showHidden ? { isHidden: true } : { isHidden: { $ne: true } };
 
-    if (query.trim()) {
-      if (query.length > 100) return res.status(400).json({ message: 'Search query is too long.' });
-      const safe  = escapeRegex(query.trim());
-      const regex = new RegExp(safe, 'i');
-      // `field` limits the search to one column (allow-listed); otherwise search all.
-      if (field && SEARCHABLE_FIELDS.includes(field)) {
-        filter[field] = regex;
-      } else {
-        filter.$or = SEARCHABLE_FIELDS.map((f) => ({ [f]: regex }));
-      }
+    if (query) {
+      const regex = new RegExp(escapeRegex(query), 'i');
+      const fields = SEARCHABLE_FIELDS.includes(field) ? [field] : SEARCHABLE_FIELDS;
+      filter.$or = fields.map((f) => ({ [f]: regex }));
     }
 
-    const pageNum  = Math.max(parseInt(page)  || 1, 1);
-    const limitNum = allPages === 'true'
-      ? Math.min(parseInt(limit) || 500, 500)
-      : Math.min(parseInt(limit) || 50,  200);
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    let limitNum;
+    if (isAdmin) {
+      limitNum = allPages === 'true'
+        ? Math.min(parseInt(limit, 10) || 500, 500)
+        : Math.min(parseInt(limit, 10) || 50, 200);
+    } else {
+      // Shared-password users get small pages only: limits how fast the whole table can be scraped.
+      limitNum = Math.min(parseInt(limit, 10) || 25, 50);
+    }
 
-    const skip  = (pageNum - 1) * limitNum;
+    const skip = (pageNum - 1) * limitNum;
     const total = await Consumer.countDocuments(filter);
 
-    const consumers = await Consumer.find(filter)
-      .skip(skip)
-      .limit(limitNum)
-      .lean();
+    // Stable sort: without it, MongoDB may return overlapping/missing rows between pages.
+    const consumers = await Consumer.find(filter).sort({ _id: 1 }).skip(skip).limit(limitNum).lean();
 
     res.json({
       consumers,
       total,
-      page:       pageNum,
-      limit:      limitNum,
+      page: pageNum,
+      limit: limitNum,
       totalPages: Math.ceil(total / limitNum),
-      hasMore:    skip + consumers.length < total,
+      hasMore: skip + consumers.length < total,
     });
   } catch (err) {
-    console.error('Error in searchConsumers:', err);
-    return sendServerError(res, err, 'consumerController');
+    serverError(req, res, err);
   }
 };
 
-// Admin: Bulk unhide all consumers
+// Admin: bulk unhide all consumers
 exports.bulkUnhideConsumers = async (req, res) => {
   try {
     const result = await Consumer.updateMany({}, { $set: { isHidden: false } });
     await logConsumerAction('CONSUMER_BULK_UNHIDDEN', req, null, { modifiedCount: result.modifiedCount });
     res.json({ message: 'All consumers unhidden', modifiedCount: result.modifiedCount });
   } catch (err) {
-    return sendServerError(res, err, 'consumerController');
+    serverError(req, res, err);
   }
 };
 
-// Admin: Bulk hide all consumers
+// Admin: bulk hide all consumers
 exports.bulkHideConsumers = async (req, res) => {
   try {
     const result = await Consumer.updateMany({}, { $set: { isHidden: true } });
     await logConsumerAction('CONSUMER_BULK_HIDDEN', req, null, { modifiedCount: result.modifiedCount });
     res.json({ message: 'All consumers hidden', modifiedCount: result.modifiedCount });
   } catch (err) {
-    return sendServerError(res, err, 'consumerController');
+    serverError(req, res, err);
   }
 };
 
-// Add new consumer (admin only — sanitized)
+// Admin: add a new consumer (sanitized)
 exports.addConsumer = async (req, res) => {
   try {
-    const consumer = new Consumer(sanitize(req.body));
+    const consumer = new Consumer(sanitizeConsumer(req.body));
     await consumer.save();
     await logConsumerAction('CONSUMER_ADDED', req, consumer.accountNumber, {
       accountName: consumer.accountName,
     });
     res.status(201).json(consumer);
   } catch (err) {
-    console.error('[consumerController]', err); return res.status(400).json({ message: 'Invalid data.' });
+    writeError(req, res, err);
   }
 };
 
-// Admin: Hide consumer (soft delete)
+// Admin: hide consumer (soft delete). :id is validated by router.param
 exports.hideConsumer = async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ message: 'Invalid consumer ID.' });
     const consumer = await Consumer.findByIdAndUpdate(req.params.id, { isHidden: true }, { new: true });
     if (!consumer) return res.status(404).json({ message: 'Consumer not found' });
     await logConsumerAction('CONSUMER_HIDDEN', req, consumer.accountNumber, {
@@ -160,14 +124,13 @@ exports.hideConsumer = async (req, res) => {
     });
     res.json({ message: 'Consumer hidden', consumer });
   } catch (err) {
-    return sendServerError(res, err, 'consumerController');
+    serverError(req, res, err);
   }
 };
 
-// Admin: Unhide consumer
+// Admin: unhide consumer
 exports.unhideConsumer = async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ message: 'Invalid consumer ID.' });
     const consumer = await Consumer.findByIdAndUpdate(req.params.id, { isHidden: false }, { new: true });
     if (!consumer) return res.status(404).json({ message: 'Consumer not found' });
     await logConsumerAction('CONSUMER_UNHIDDEN', req, consumer.accountNumber, {
@@ -175,14 +138,13 @@ exports.unhideConsumer = async (req, res) => {
     });
     res.json({ message: 'Consumer unhidden', consumer });
   } catch (err) {
-    return sendServerError(res, err, 'consumerController');
+    serverError(req, res, err);
   }
 };
 
-// Admin: Permanently delete consumer
+// Admin: permanently delete consumer
 exports.permanentDeleteConsumer = async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ message: 'Invalid consumer ID.' });
     const consumer = await Consumer.findByIdAndDelete(req.params.id);
     if (!consumer) return res.status(404).json({ message: 'Consumer not found' });
     await logConsumerAction('CONSUMER_DELETED', req, consumer.accountNumber, {
@@ -190,36 +152,38 @@ exports.permanentDeleteConsumer = async (req, res) => {
     });
     res.json({ message: 'Consumer permanently deleted' });
   } catch (err) {
-    return sendServerError(res, err, 'consumerController');
+    serverError(req, res, err);
   }
 };
 
-// Get a single consumer by ID — admin only, respects isHidden
+// Get a single consumer by ID: any logged-in role; hidden records are admin-only.
 exports.getConsumer = async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ message: 'Invalid consumer ID.' });
     const consumer = await Consumer.findById(req.params.id);
     if (!consumer) return res.status(404).json({ message: 'Consumer not found' });
-    if (consumer.isHidden === true && !req.adminEmail)
+    if (consumer.isHidden === true && req.role !== 'admin') {
       return res.status(404).json({ message: 'Consumer not found' });
+    }
     res.json(consumer);
   } catch (err) {
-    return sendServerError(res, err, 'consumerController');
+    serverError(req, res, err);
   }
 };
 
-// Admin: Update consumer (sanitized)
+// Admin: update consumer (sanitized)
 exports.updateConsumer = async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ message: 'Invalid consumer ID.' });
-    const consumer = await Consumer.findByIdAndUpdate(req.params.id, sanitize(req.body), { new: true });
+    const consumer = await Consumer.findByIdAndUpdate(req.params.id, sanitizeConsumer(req.body), {
+      new: true,
+      runValidators: true,
+    });
     if (!consumer) return res.status(404).json({ message: 'Consumer not found' });
     await logConsumerAction('CONSUMER_UPDATED', req, consumer.accountNumber, {
       accountName: consumer.accountName,
-      fields: Object.keys(req.body),
+      fields: Object.keys(sanitizeConsumer(req.body)),
     });
     res.json(consumer);
   } catch (err) {
-    return sendServerError(res, err, 'consumerController');
+    writeError(req, res, err);
   }
 };

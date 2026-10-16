@@ -18,7 +18,7 @@ const AdminConfig  = require('../models/AdminConfig');
 const AuditLog     = require('../models/AuditLog');
 const RefreshToken = require('../models/RefreshToken');
 const { __verify: verifyIdToken } = require('google-auth-library');
-const app = require('../app');
+const app = require('../app')();
 
 const ID = '507f1f77bcf86cd799439011';
 
@@ -27,8 +27,9 @@ const tokenFor = (role, extra = {}, opts = { expiresIn: '10m' }) =>
 const asUser  = () => ['accessToken=' + tokenFor('user')];
 const asAdmin = () => ['accessToken=' + tokenFor('admin', { email: 'admin@example.com' })];
 
-// Mongoose-style chain: find().skip().limit().lean()
-const findChain = (rows = []) => ({ skip: () => ({ limit: () => ({ lean: () => Promise.resolve(rows) }) }) });
+// Mongoose-style chain: find().sort().skip().limit().lean()
+const { queryChain } = require('./helpers');
+const findChain = (rows = []) => queryChain(rows);
 const lastFilter = () => Consumer.find.mock.calls[Consumer.find.mock.calls.length - 1][0];
 
 beforeEach(() => {
@@ -138,8 +139,8 @@ describe('search', () => {
   test('field filter is honoured when it is on the allow-list', async () => {
     await request(app).get('/api/consumers/search?query=abc&field=accountNumber').set('Cookie', asUser());
     const f = lastFilter();
-    expect(f.accountNumber).toBeInstanceOf(RegExp);
-    expect(f.$or).toBeUndefined();
+    expect(f.$or).toHaveLength(1);
+    expect(f.$or[0].accountNumber).toBeInstanceOf(RegExp);
   });
 
   test('an unknown field is ignored and all fields are searched', async () => {
@@ -154,9 +155,10 @@ describe('search', () => {
     expect(lastFilter().$or[0].sn.source).toBe('\\(a\\+\\)\\+\\$');
   });
 
-  test('overly long queries are rejected', async () => {
+  test('overly long queries are cut down to 100 characters', async () => {
     const res = await request(app).get('/api/consumers/search?query=' + 'a'.repeat(101)).set('Cookie', asUser());
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(200);
+    expect(lastFilter().$or[0].sn.source).toHaveLength(100);
   });
 });
 
